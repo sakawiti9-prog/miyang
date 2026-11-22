@@ -1665,6 +1665,10 @@
     let rtdbEventSource = null;
     let isApplyingRemoteSnapshot = false;
     let remoteSyncTimer = null;
+    // Track changes by top-level data section so a small edit does not upload the whole journal.
+    let lastSavedStateSnapshot = JSON.parse(JSON.stringify(appState));
+    let pendingRtdbPatch = {};
+    let rtdbWriteQueue = Promise.resolve();
 
     function updateCollabHeaderBadge() {
       const badge = document.getElementById('collab-header-status');
@@ -1688,22 +1692,31 @@
       if (!collabState.connected || isApplyingRemoteSnapshot) return;
       const { safeRoom, docId } = getCollabDocPath(collabState.roomId);
       const parsedFb = parseFirebaseInputToConfig(collabState.firebaseInput);
+      let attemptedRtdbPatch = null;
 
       try {
         if (parsedFb && parsedFb.kind === 'url' && parsedFb.rtdbUrl) {
           const endpoint = `${parsedFb.rtdbUrl}/miyang_school_journal_2027/${encodeURIComponent(safeRoom)}.json`;
-          const res = await fetch(endpoint, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              roomId: collabState.roomId,
-              updatedAt: new Date().toISOString(),
-              updatedBy: collabState.userId || 'anonymous',
-              payloadJson: JSON.stringify(appState)
-            })
+          const patch = pendingRtdbPatch;
+          pendingRtdbPatch = {};
+          if (!Object.keys(patch).length) return;
+          attemptedRtdbPatch = patch;
+          const patchBody = {
+            state: patch,
+            updatedAt: new Date().toISOString(),
+            updatedBy: collabState.userId || 'anonymous'
+          };
+          // Serialize writes from this browser and PATCH only changed sections.
+          rtdbWriteQueue = rtdbWriteQueue.catch(() => {}).then(async () => {
+            const res = await fetch(endpoint, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(patchBody)
+            });
+            if (!res.ok) throw new Error(`RTDB 부분 저장 실패 (${res.status})`);
           });
-          if (!res.ok) throw new Error(`RTDB 저장 실패 (${res.status})`);
-          collabState.lastSyncText = `실시간 저장됨 (${new Date().toLocaleTimeString('ko-KR', { hour12: false })})`;
+          await rtdbWriteQueue;
+          collabState.lastSyncText = `변경 부분 저장됨 (${new Date().toLocaleTimeString('ko-KR', { hour12: false })})`;
           collabState.errorMsg = '';
           refreshCollabModalIfOpen();
           return;
@@ -1723,6 +1736,13 @@
           refreshCollabModalIfOpen();
         }
       } catch (err) {
+        if (attemptedRtdbPatch) {
+          Object.keys(attemptedRtdbPatch).forEach((key) => {
+            if (!Object.prototype.hasOwnProperty.call(pendingRtdbPatch, key)) {
+              pendingRtdbPatch[key] = attemptedRtdbPatch[key];
+            }
+          });
+        }
         collabState.errorMsg = `클라우드 저장 실패: ${err && err.message ? err.message : '권한/네트워크 확인 필요'}`;
         refreshCollabModalIfOpen();
       }
@@ -1730,10 +1750,17 @@
 
     function scheduleCloudPush() {
       if (!collabState.connected || isApplyingRemoteSnapshot) return;
+      // Compare top-level sections; keep only the latest value for each changed section.
+      Object.keys(appState).forEach((key) => {
+        const before = JSON.stringify(lastSavedStateSnapshot[key]);
+        const after = JSON.stringify(appState[key]);
+        if (before !== after) pendingRtdbPatch[key] = appState[key];
+      });
+      lastSavedStateSnapshot = JSON.parse(JSON.stringify(appState));
       if (remoteSyncTimer) clearTimeout(remoteSyncTimer);
       remoteSyncTimer = setTimeout(() => {
         pushCurrentStateToCloud();
-      }, 250);
+      }, 350);
     }
 
     async function initRealtimeCollab(customRoomId = '', customFirebaseInput = null) {
@@ -1773,14 +1800,27 @@
           const res = await fetch(endpoint);
           if (!res.ok) throw new Error(`Firebase 연결 응답 오류 (${res.status})`);
           const data = await res.json();
-          if (data && data.payloadJson) {
-            const remoteData = JSON.parse(data.payloadJson);
+          if (data && (data.state || data.payloadJson)) {
+            // New format stores state by section; payloadJson is read for backward compatibility.
+            const remoteData = data.state && typeof data.state === 'object'
+              ? data.state
+              : JSON.parse(data.payloadJson);
             if (remoteData && typeof remoteData === 'object') {
               isApplyingRemoteSnapshot = true;
               appState = { ...appState, ...remoteData };
               localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
+              lastSavedStateSnapshot = JSON.parse(JSON.stringify(appState));
               isApplyingRemoteSnapshot = false;
               renderAllViews();
+              // Migrate the legacy single-string record once, without deleting its original field.
+              if (!data.state) {
+                const migrateRes = await fetch(endpoint, {
+                  method: 'PATCH',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ state: remoteData })
+                });
+                if (!migrateRes.ok) throw new Error(`Firebase 데이터 구조 전환 실패 (${migrateRes.status})`);
+              }
             }
           } else {
             // First connection only: seed an empty shared room with this browser's existing data.
@@ -1791,10 +1831,12 @@
                 roomId: chosenRoom,
                 updatedAt: new Date().toISOString(),
                 updatedBy: 'initial-seed',
+                state: appState,
                 payloadJson: JSON.stringify(appState)
               })
             });
             if (!seedRes.ok) throw new Error(`Firebase 최초 데이터 등록 실패 (${seedRes.status})`);
+            lastSavedStateSnapshot = JSON.parse(JSON.stringify(appState));
           }
 
           collabState.connected = true;
@@ -1811,17 +1853,30 @@
             try {
               const message = JSON.parse(event.data || '{}');
               if (!message || !Object.prototype.hasOwnProperty.call(message, 'data')) return;
-              // This stream is attached to the exact shared-room node, so a root put carries the full record.
-              if (message.path && message.path !== '/') return;
-              const incomingRecord = message.data;
-              if (!incomingRecord || !incomingRecord.payloadJson) return;
-              const incoming = JSON.parse(incomingRecord.payloadJson);
-              if (!incoming || typeof incoming !== 'object') return;
-              const merged = { ...appState, ...incoming };
+              const eventPath = message.path || '/';
+              let incomingState = null;
+              if (eventPath === '/' || eventPath === '') {
+                const record = message.data;
+                if (record && record.state && typeof record.state === 'object') {
+                  incomingState = record.state;
+                } else if (record && record.payloadJson) {
+                  incomingState = JSON.parse(record.payloadJson);
+                }
+              } else if (eventPath === '/state') {
+                incomingState = message.data;
+              } else if (eventPath.startsWith('/state/')) {
+                const sectionKey = decodeURIComponent(eventPath.slice('/state/'.length).split('/')[0]);
+                if (sectionKey && !eventPath.slice('/state/'.length).includes('/')) {
+                  incomingState = { [sectionKey]: message.data };
+                }
+              }
+              if (!incomingState || typeof incomingState !== 'object') return;
+              const merged = { ...appState, ...incomingState };
               if (JSON.stringify(appState) !== JSON.stringify(merged)) {
                 isApplyingRemoteSnapshot = true;
                 appState = merged;
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
+                lastSavedStateSnapshot = JSON.parse(JSON.stringify(appState));
                 isApplyingRemoteSnapshot = false;
                 renderAllViews();
                 showToast('동료가 수정한 학교일지 내용이 실시간 반영되었습니다.');
@@ -1936,6 +1991,7 @@
               isApplyingRemoteSnapshot = true;
               appState = { ...appState, ...incoming };
               localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
+              lastSavedStateSnapshot = JSON.parse(JSON.stringify(appState));
               isApplyingRemoteSnapshot = false;
               renderAllViews();
               showToast('동료가 수정한 학교일지 내용이 실시간 반영되었습니다.');
@@ -2074,7 +2130,6 @@
 
     function saveAndConfirm(sectionKey, toastMessage) {
       saveAppState();
-      pushCurrentStateToCloud();
       const nowStr = new Date().toLocaleTimeString('ko-KR', { hour12: false });
       if (sectionKey === 'bus') {
         const banner = document.getElementById('save-banner-bus');
